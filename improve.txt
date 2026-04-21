@@ -1,0 +1,99 @@
+继续的话，我建议你别再试“往特征后面拼几何先验”了，近两年更值得借鉴的模块可以分成两类。
+
+**最适合你当前这份无训练 `Simple3D` 的**
+1. `Joint Local-Global Memory Bank`
+来源：PointCore, 2025，[ScienceDirect](https://www.sciencedirect.com/science/article/abs/pii/S0893608025013279)  
+适合接入：
+- [FPFH.py](/D:/MiniShift-Simple3D-main/feature_extractors/FPFH.py) 输出一个全局 descriptor
+- [features.py](/D:/MiniShift-Simple3D-main/feature_extractors/features.py) 里把局部库和全局库联合匹配  
+模块价值：
+- 比你试过的“拼接曲率/上下文”更像真正的新模块
+- 更适合 memory-bank 框架
+- 不一定需要训练  
+优先级：最高
+
+2. `Ranking-based Score Normalization`
+来源：PointCore, 2025，[ScienceDirect](https://www.sciencedirect.com/science/article/abs/pii/S0893608025013279)  
+适合接入：
+- [features.py](/D:/MiniShift-Simple3D-main/feature_extractors/features.py) 的 `compute_anomay_scores()` 后  
+模块价值：
+- 如果你后面做 local/global 双分支，这个模块很重要
+- 不需要训练
+- 比单纯改 top-k pooling 更像可写进论文的模块  
+优先级：高
+
+3. `Registration-guided Rotation-Invariant Module`
+来源：NeurIPS 2025，[OpenReview](https://openreview.net/forum?id=QynKUq9X3L)  
+适合接入：
+- 预处理/对齐模块，放在数据加载后、特征提取前  
+模块价值：
+- 对 ShapeNet 这类姿态变化更敏感的数据更有意义
+- 比继续堆局部几何统计更可能有效  
+缺点：
+- 改动会比前两个大
+- 实现成本中高  
+优先级：中高
+
+4. `Density-aware Upsampling / Homogeneity Module`
+来源：DAUP, 2024，[ScienceDirect](https://www.sciencedirect.com/science/article/abs/pii/S1474034624004713)  
+适合接入：
+- `data/*.py` 或 [FPFH.py](/D:/MiniShift-Simple3D-main/feature_extractors/FPFH.py) 前  
+模块价值：
+- 从数据分布层面改善局部邻域质量
+- 对高分辨率但密度不均的数据更合理  
+缺点：
+- 原论文是学习式 upsampling
+- 你如果坚持无训练，只能借思路做简化版  
+优先级：中
+
+**如果你愿意接受训练模块**
+5. `Feature Adaptor`
+来源：Scientific Reports 2026，[Nature](https://www.nature.com/articles/s41598-026-41255-2)  
+适合接入：
+- [FPFH.py](/D:/MiniShift-Simple3D-main/feature_extractors/FPFH.py) 的 `agg_point_feature` 后  
+模块价值：
+- 两层 MLP 适配器，很轻
+- 比你前面试的无训练增强更可能真正带来提升  
+缺点：
+- 需要训练  
+优先级：很高
+
+6. `Selective Anomalous Feature Generator`
+来源：同上，[Nature](https://www.nature.com/articles/s41598-026-41255-2)  
+适合接入：
+- 特征级数据增强分支  
+模块价值：
+- 能制造 hard negative
+- 适合提升判别边界  
+缺点：
+- 需要训练
+- 会把框架改成训练式  
+优先级：中高
+
+7. `Point Offset Prediction Module`
+来源：PO3AD, CVPR 2025，[CVPR Open Access](https://openaccess.thecvf.com/content/CVPR2025/html/Ye_PO3AD_Predicting_Point_Offsets_toward_Better_3D_Point_Cloud_Anomaly_CVPR_2025_paper.html)  
+模块价值：
+- 是近两年很强的一条线
+- 正常向量引导伪异常、点偏移预测都很有论文感  
+缺点：
+- 基本等于另起一套训练框架
+- 不适合在当前 Simple3D 上做“小改”  
+优先级：如果你接受重构，则高；否则低
+
+**结合你现在的实验结果，我的建议非常明确**
+如果你还想尽量保持当前框架不训练，下一步最值得试的是：
+
+1. `Joint Local-Global Memory Bank`
+2. `Ranking-based Score Normalization`
+
+如果你愿意开始引入训练，最值得试的是：
+
+1. `Feature Adaptor`
+2. 再考虑 `Selective Anomalous Feature Generator`
+
+一句话总结：
+- 无训练路线：优先做 `PointCore` 这条线
+- 可训练路线：优先做 `Feature Adaptor`
+
+如果你愿意，我下一步就直接帮你选一个最合适的方向落代码。  
+我建议先做：**Joint Local-Global Memory Bank**。

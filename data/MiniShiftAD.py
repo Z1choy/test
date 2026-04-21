@@ -8,7 +8,7 @@ from utils.mvtec3d_util import *
 from torch.utils.data import DataLoader
 import numpy as np
 import open3d as o3d
-DATASETS_PATH = os.environ.get('MINISHIFT_DATASET_PATH', '/home/luozhichao/datasets/MiniShiftAD')
+DATASETS_PATH = os.environ.get('MINISHIFT_DATASET_PATH', '/media/chenyu/MiniShiftAD')
 
 def minishiftAD_classes():
     return [

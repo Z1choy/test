@@ -61,38 +61,43 @@ class FPFHFeatures(Features):
 
         voxel_size = 1000000
         o3d_pc.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=10000, max_nn=10))
-
-        radius_feature = 1000000
-        pcd_fpfh = o3d.pipelines.registration.compute_fpfh_feature(o3d_pc, o3d.geometry.KDTreeSearchParamHybrid
-        (radius=radius_feature, max_nn=self.args.max_nn))
-        fpfh_np = np.asarray(pcd_fpfh.data.T, dtype=np.float32)
-        fpfh = torch.from_numpy(fpfh_np).to(self.args.device)
-
-
-        if self.args.use_MSND:
-            pcd_fpfh = o3d.pipelines.registration.compute_fpfh_feature(o3d_pc, o3d.geometry.KDTreeSearchParamHybrid
-            (radius=radius_feature, max_nn=2*self.args.max_nn))
-            fpfh2_np = np.asarray(pcd_fpfh.data.T, dtype=np.float32).copy()
-            fpfh2 = torch.from_numpy(fpfh2_np).to(self.args.device)
-            fpfh = torch.cat([fpfh,fpfh2],dim=-1)
-
-
-            if self.args.num_MSND == 2:
-                pcd_fpfh = o3d.pipelines.registration.compute_fpfh_feature(o3d_pc, o3d.geometry.KDTreeSearchParamHybrid
-                (radius=radius_feature, max_nn=3*self.args.max_nn))
-                fpfh3_np = np.asarray(pcd_fpfh.data.T, dtype=np.float32).copy()
-                fpfh3 = torch.from_numpy(fpfh3_np).to(self.args.device)
-
-
-                fpfh = torch.cat([fpfh,fpfh2,fpfh3],dim=-1)
+        normals_np = np.asarray(o3d_pc.normals, dtype=np.float32).copy()
         
         # fps the centers out
         # unorganized_pc_no_zeros expected (1,n,3)
         unorganized_pc_no_zeros = torch.tensor(unorganized_pc_no_zeros).to(self.args.device).unsqueeze(dim=0)
         unorganized_pc_no_zeros = unorganized_pc_no_zeros.to(torch.float32)
+        normals = torch.from_numpy(normals_np).to(self.args.device).unsqueeze(dim=0)
         # unorganized_pc_no_zeros expected (1,n,3)
         batch_size, num_points, _ = unorganized_pc_no_zeros.contiguous().shape
         center, center_idx = fps(unorganized_pc_no_zeros.contiguous(), self.args.num_group)  # B G 3
+        center_idx = center_idx.long()
+
+        radius_feature = 1000000
+        pcd_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+            o3d_pc,
+            o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=self.args.max_nn),
+        )
+        base_descriptors_np = np.asarray(pcd_fpfh.data.T, dtype=np.float32)
+        base_descriptors = torch.from_numpy(base_descriptors_np).to(self.args.device)
+
+        if self.args.use_MSND:
+            pcd_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+                o3d_pc,
+                o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=2 * self.args.max_nn),
+            )
+            descriptor_2_np = np.asarray(pcd_fpfh.data.T, dtype=np.float32).copy()
+            descriptor_2 = torch.from_numpy(descriptor_2_np).to(self.args.device)
+            base_descriptors = torch.cat([base_descriptors, descriptor_2], dim=-1)
+
+            if self.args.num_MSND == 2:
+                pcd_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+                    o3d_pc,
+                    o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=3 * self.args.max_nn),
+                )
+                descriptor_3_np = np.asarray(pcd_fpfh.data.T, dtype=np.float32).copy()
+                descriptor_3 = torch.from_numpy(descriptor_3_np).to(self.args.device)
+                base_descriptors = torch.cat([base_descriptors, descriptor_2, descriptor_3], dim=-1)
 
         # knn to get the neighborhood
         knn = KNN(k=self.args.group_size, transpose_mode=True)
@@ -104,24 +109,18 @@ class FPFHFeatures(Features):
         
         idx = idx + idx_base
         idx = idx.view(-1)
-        neighborhood = fpfh.reshape(batch_size * num_points, -1)[idx, :]
+        grouped_xyz = unorganized_pc_no_zeros.reshape(batch_size * num_points, -1)[idx, :]
+        grouped_xyz = grouped_xyz.reshape(batch_size, self.args.num_group, self.args.group_size, -1).contiguous()
+        neighborhood = base_descriptors.reshape(batch_size * num_points, -1)[idx, :]
         neighborhood = neighborhood.reshape(batch_size, self.args.num_group, self.args.group_size, -1).contiguous()
-        # print("neighborhood",neighborhood.shape)
         agg_point_feature = torch.mean(neighborhood,-2)
 
         if self.args.use_LFSA:
             agg_point_feature = agg_point_feature.squeeze()
         else:
-            agg_point_feature = fpfh.squeeze()
+            agg_point_feature = base_descriptors.squeeze()
 
         unorganized_pc = torch.tensor(unorganized_pc)
-
-        # agg_point_feature (group,f)
-        # unorganized_pc (n,3)
-        # unorganized_pc_no_zeros (1,n,3)
-        # center (1,group,3)
-
-        # print(agg_point_feature.shape,unorganized_pc.shape,unorganized_pc_no_zeros.shape,center.shape)
         return agg_point_feature,unorganized_pc,unorganized_pc_no_zeros,center
 
     def get_features(self,unorganized_pc):
@@ -152,7 +151,7 @@ class FPFHFeatures(Features):
         # unorganized_pc_no_zeros (1,n,3)
         # center (1,group,3)
 
-        feature_maps,_,_,_ = self.get_features(pc)
+        feature_maps, _, _, _ = self.get_features(pc)
         self.patch_lib.append(feature_maps)
 
     def predict(self, pc, mask, label, path=None):
@@ -162,7 +161,15 @@ class FPFHFeatures(Features):
         # center (1,group,3)
 
         agg_point_feature,unorganized_pc,unorganized_pc_no_zeros,center = self.get_features(pc)
-        self.compute_anomay_scores(agg_point_feature, mask, label,path, unorganized_pc,unorganized_pc_no_zeros,center)
+        self.compute_anomay_scores(
+            agg_point_feature,
+            mask,
+            label,
+            path,
+            unorganized_pc,
+            unorganized_pc_no_zeros,
+            center,
+        )
 
 
 

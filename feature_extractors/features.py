@@ -132,6 +132,7 @@ class Features(torch.nn.Module):
         self.tmp_patch_lib = []
         self.name_list = []
         self.test_patch_lib = []
+        self.patch_lib_neighbor_scale = None
 
 
         self.image_preds = list()
@@ -169,16 +170,92 @@ class Features(torch.nn.Module):
         self.pixel_rocauc = 0
         self.au_pro = 0
 
+    def _reduce_knn_distances(self, knn_distances, knn_indices, matching_mode, temperature, consistency_weight, neighbor_scale_bank=None):
+        if matching_mode == "knn_mean":
+            return knn_distances.mean(dim=1)
 
+        weights = torch.softmax(-knn_distances / temperature, dim=1)
+        weighted_distance = torch.sum(weights * knn_distances, dim=1)
+
+        if matching_mode == "distance_weighted":
+            return weighted_distance
+
+        if matching_mode == "adaptive_knn":
+            if neighbor_scale_bank is not None and knn_indices is not None:
+                neighbor_scale = neighbor_scale_bank[knn_indices].mean(dim=1)
+            else:
+                neighbor_scale = knn_distances.mean(dim=1)
+
+            normalized_distance = weighted_distance / neighbor_scale.clamp_min(1e-6)
+            consistency = knn_distances.std(dim=1, unbiased=False) / knn_distances.mean(dim=1).clamp_min(1e-6)
+            return normalized_distance * (1.0 + consistency_weight * consistency)
+
+        return knn_distances[:, 0]
+
+    def _compute_memory_matching_scores(
+        self,
+        query,
+        memory_bank,
+        matching_mode,
+        k,
+        temperature,
+        consistency_weight,
+        neighbor_scale_bank=None,
+    ):
+        dist = torch.cdist(query, memory_bank)
+        if matching_mode == "1nn":
+            scores, _ = torch.min(dist, dim=1)
+            return scores
+
+        k = min(k, memory_bank.shape[0])
+        if k <= 1:
+            scores, _ = torch.min(dist, dim=1)
+            return scores
+
+        knn_distances, knn_indices = torch.topk(dist, k=k, largest=False, dim=1)
+        return self._reduce_knn_distances(
+            knn_distances,
+            knn_indices,
+            matching_mode,
+            temperature,
+            consistency_weight,
+            neighbor_scale_bank=neighbor_scale_bank,
+        )
+
+    def _build_patch_library_statistics(self):
+        matching_mode = getattr(self.args, "matching_mode", "1nn").lower()
+        if matching_mode != "adaptive_knn":
+            self.patch_lib_neighbor_scale = None
+            return
+
+        density_k = min(getattr(self.args, "matching_density_k", 5), max(self.patch_lib.shape[0] - 1, 1))
+        if density_k <= 0 or self.patch_lib.shape[0] < 2:
+            self.patch_lib_neighbor_scale = None
+            return
+
+        with torch.no_grad():
+            lib_dist = torch.cdist(self.patch_lib, self.patch_lib)
+            lib_dist.fill_diagonal_(float("inf"))
+            neighbor_distances, _ = torch.topk(lib_dist, k=density_k, largest=False, dim=1)
+            self.patch_lib_neighbor_scale = neighbor_distances.mean(dim=1).clamp_min(1e-6)
+
+    def _compute_patch_matching_scores(self, patch):
+        return self._compute_memory_matching_scores(
+            patch,
+            self.patch_lib,
+            getattr(self.args, "matching_mode", "1nn").lower(),
+            getattr(self.args, "matching_k", 5),
+            max(getattr(self.args, "matching_temperature", 1.0), 1e-6),
+            max(getattr(self.args, "matching_consistency_weight", 0.5), 0.0),
+            neighbor_scale_bank=self.patch_lib_neighbor_scale,
+        )
 
 
     def compute_anomay_scores(self, patch, mask, label, path, unorganized_pc, unorganized_pc_no_zeros, center):
 
-        dist = torch.cdist(patch, self.patch_lib)  
-        min_val, min_idx = torch.min(dist, dim=1)
-
         feature_map_dims = patch.shape[0]
-        s_map = min_val.view(1, 1, feature_map_dims)
+        patch_scores = self._compute_patch_matching_scores(patch)
+        s_map = patch_scores.view(1, 1, feature_map_dims)
 
 
         if self.args.use_LFSA:
@@ -222,7 +299,7 @@ class Features(torch.nn.Module):
             s = torch.mean(tmp_s)
         if self.args.dataset == 'mulsen' or self.args.dataset == 'minishift' or self.args.dataset == 'quan':
             tmp_s,_ = torch.topk(s_map, 80)
-            s = torch.mean(tmp_s)     
+            s = torch.mean(tmp_s)
         
 
         if self.args.vis_save:
@@ -311,6 +388,10 @@ class Features(torch.nn.Module):
                                                             eps=self.coreset_eps, )
             
             self.patch_lib = self.patch_lib[self.coreset_idx].to(self.args.device)
+        else:
+            self.patch_lib = self.patch_lib.to(self.args.device)
+
+        self._build_patch_library_statistics()
 
                
 
