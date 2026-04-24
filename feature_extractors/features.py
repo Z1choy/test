@@ -224,7 +224,13 @@ class Features(torch.nn.Module):
 
     def _build_patch_library_statistics(self):
         matching_mode = getattr(self.args, "matching_mode", "1nn").lower()
-        if matching_mode != "adaptive_knn":
+        mmd_base_matching_mode = getattr(self.args, "mmd_base_matching_mode", "1nn").lower()
+        use_adaptive_statistics = (
+            matching_mode == "adaptive_knn"
+            or (matching_mode == "mmd" and mmd_base_matching_mode == "adaptive_knn")
+        )
+
+        if not use_adaptive_statistics:
             self.patch_lib_neighbor_scale = None
             return
 
@@ -239,22 +245,256 @@ class Features(torch.nn.Module):
             neighbor_distances, _ = torch.topk(lib_dist, k=density_k, largest=False, dim=1)
             self.patch_lib_neighbor_scale = neighbor_distances.mean(dim=1).clamp_min(1e-6)
 
-    def _compute_patch_matching_scores(self, patch):
+    def _compute_patch_matching_scores(self, patch, matching_mode=None):
+        matching_mode = getattr(self.args, "matching_mode", "1nn").lower() if matching_mode is None else matching_mode
         return self._compute_memory_matching_scores(
             patch,
             self.patch_lib,
-            getattr(self.args, "matching_mode", "1nn").lower(),
+            matching_mode,
             getattr(self.args, "matching_k", 5),
             max(getattr(self.args, "matching_temperature", 1.0), 1e-6),
             max(getattr(self.args, "matching_consistency_weight", 0.5), 0.0),
             neighbor_scale_bank=self.patch_lib_neighbor_scale,
         )
 
+    def _compute_image_level_score(self, s_map):
+        s = torch.max(s_map)
+
+        if self.args.dataset == 'real':
+            s = torch.mean(s_map)
+        if self.args.dataset == 'shapenet':
+            tmp_s, _ = torch.topk(s_map, 80)
+            s = torch.mean(tmp_s)
+        if self.args.dataset == 'mulsen' or self.args.dataset == 'minishift' or self.args.dataset == 'quan':
+            tmp_s, _ = torch.topk(s_map, 80)
+            s = torch.mean(tmp_s)
+
+        return s
+
+    def _estimate_mmd_sigma(self, x_set, y_set):
+        sigma = float(getattr(self.args, "mmd_sigma", 1.0))
+        if sigma > 0:
+            return sigma
+
+        sample_x = x_set[: min(64, x_set.shape[0])]
+        sample_y = y_set[: min(64, y_set.shape[0])]
+        joined = torch.cat([sample_x, sample_y], dim=0)
+        if joined.shape[0] < 2:
+            return 1.0
+
+        with torch.no_grad():
+            pairwise = torch.cdist(joined, joined)
+            pairwise = pairwise[pairwise > 0]
+            if pairwise.numel() == 0:
+                return 1.0
+            return pairwise.median().item()
+
+    def _normalize_ard_weights(self, relevance):
+        eps = max(float(getattr(self.args, "ard_eps", 1e-6)), 1e-12)
+        min_weight = max(float(getattr(self.args, "ard_min_weight", 0.0)), 0.0)
+        weight_norm = getattr(self.args, "ard_weight_norm", "softmax").lower()
+
+        if weight_norm == "l1":
+            weights = relevance + eps
+            weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(eps)
+        else:
+            temperature = max(float(getattr(self.args, "ard_temperature", 1.0)), eps)
+            weights = torch.softmax(relevance / temperature, dim=-1)
+
+        if min_weight > 0:
+            weights = torch.clamp(weights, min=min_weight)
+            weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(eps)
+
+        return weights
+
+    def _compute_ard_weights(self, x_set, y_set):
+        eps = max(float(getattr(self.args, "ard_eps", 1e-6)), 1e-12)
+
+        if x_set.dim() == 2:
+            x_set = x_set.unsqueeze(0)
+        if y_set.dim() == 2:
+            y_set = y_set.unsqueeze(0)
+
+        x_mean = x_set.mean(dim=-2)
+        y_mean = y_set.mean(dim=-2)
+        y_std = y_set.std(dim=-2, unbiased=False)
+
+        relevance = torch.abs(x_mean - y_mean) / (y_std + eps)
+        return self._normalize_ard_weights(relevance)
+
+    def _compute_ard_rbf_kernel(self, x_set, y_set, ard_weights, sigma):
+        if x_set.dim() == 2:
+            x_set = x_set.unsqueeze(0)
+        if y_set.dim() == 2:
+            y_set = y_set.unsqueeze(0)
+        if ard_weights.dim() == 1:
+            ard_weights = ard_weights.unsqueeze(0)
+
+        diff_sq = (x_set.unsqueeze(-2) - y_set.unsqueeze(-3)) ** 2
+        weighted_dist_sq = (diff_sq * ard_weights.unsqueeze(-2).unsqueeze(-2)).sum(dim=-1)
+        kernel = torch.exp(-weighted_dist_sq / (2 * (max(sigma, 1e-6) ** 2)))
+        return kernel.squeeze(0) if kernel.shape[0] == 1 else kernel
+
+    def _compute_kernel(self, x_set, y_set, sigma, ard_weights=None):
+        kernel_type = getattr(self.args, "mmd_kernel", "rbf").lower()
+
+        if kernel_type == "ard_rbf":
+            if ard_weights is None:
+                ard_weights = self._compute_ard_weights(x_set, y_set)
+            return self._compute_ard_rbf_kernel(x_set, y_set, ard_weights, sigma)
+
+        if kernel_type == "cosine":
+            x_norm = torch.nn.functional.normalize(x_set, dim=-1)
+            y_norm = torch.nn.functional.normalize(y_set, dim=-1)
+            return torch.matmul(x_norm, y_norm.transpose(-1, -2)).clamp(-1.0, 1.0)
+
+        if kernel_type == "laplacian":
+            dist = torch.cdist(x_set, y_set)
+            return torch.exp(-dist / max(sigma, 1e-6))
+
+        if kernel_type == "polynomial":
+            degree = max(int(getattr(self.args, "mmd_poly_degree", 2)), 1)
+            coef0 = float(getattr(self.args, "mmd_poly_coef0", 1.0))
+            return (torch.matmul(x_set, y_set.transpose(-1, -2)) + coef0) ** degree
+
+        if kernel_type in ("rq", "rational_quadratic", "rational-quadratic"):
+            alpha = max(float(getattr(self.args, "mmd_rq_alpha", 1.0)), 1e-6)
+            dist_sq = torch.cdist(x_set, y_set) ** 2
+            return (1.0 + dist_sq / (2.0 * alpha * max(sigma, 1e-6) ** 2)) ** (-alpha)
+
+        dist_sq = torch.cdist(x_set, y_set) ** 2
+        return torch.exp(-dist_sq / (2 * (max(sigma, 1e-6) ** 2)))
+
+    def _compute_mmd_score(self, x_set, y_set, sigma, ard_weights=None):
+        k_xx = self._compute_kernel(x_set, x_set, sigma, ard_weights=ard_weights)
+        k_yy = self._compute_kernel(y_set, y_set, sigma, ard_weights=ard_weights)
+        k_xy = self._compute_kernel(x_set, y_set, sigma, ard_weights=ard_weights)
+
+        mmd_sq = k_xx.mean() + k_yy.mean() - 2.0 * k_xy.mean()
+        return torch.sqrt(torch.clamp(mmd_sq, min=0.0) + 1e-12)
+
+    def _select_mmd_reference_subset(self, patch, local_patch_scores):
+        reference_mode = getattr(self.args, "mmd_reference_mode", "topk_nn").lower()
+        max_reference = min(getattr(self.args, "mmd_k", 128), self.patch_lib.shape[0])
+        if max_reference <= 0:
+            return self.patch_lib[:1]
+
+        if reference_mode != "topk_nn":
+            return self.patch_lib[:max_reference]
+
+        query_count = min(
+            patch.shape[0],
+            max(4, min(32, max_reference // 4 if max_reference >= 4 else max_reference)),
+        )
+        if query_count <= 0:
+            return self.patch_lib[:max_reference]
+
+        _, query_indices = torch.topk(local_patch_scores, k=query_count, largest=True)
+        focused_patch = patch[query_indices]
+
+        candidate_k = min(self.patch_lib.shape[0], max(1, int(np.ceil(max_reference / query_count))))
+        candidate_distances = torch.cdist(focused_patch, self.patch_lib)
+        knn_distances, knn_indices = torch.topk(candidate_distances, k=candidate_k, largest=False, dim=1)
+
+        flat_indices = knn_indices.reshape(-1).detach().cpu().tolist()
+        flat_distances = knn_distances.reshape(-1).detach().cpu().tolist()
+        sorted_pairs = sorted(zip(flat_distances, flat_indices), key=lambda item: item[0])
+
+        selected = []
+        visited = set()
+        for _, idx in sorted_pairs:
+            if idx in visited:
+                continue
+            visited.add(idx)
+            selected.append(idx)
+            if len(selected) >= max_reference:
+                break
+
+        if not selected:
+            return self.patch_lib[:max_reference]
+
+        selected_idx = torch.tensor(selected, device=self.patch_lib.device, dtype=torch.long)
+        return self.patch_lib[selected_idx]
+
+    def _compute_mmd_matching_score(self, patch, local_patch_scores):
+        reference_set = self._select_mmd_reference_subset(patch, local_patch_scores)
+        sigma = self._estimate_mmd_sigma(patch, reference_set)
+        ard_weights = None
+        if getattr(self.args, "mmd_kernel", "rbf").lower() == "ard_rbf":
+            ard_weights = self._compute_ard_weights(patch, reference_set)
+        return self._compute_mmd_score(patch, reference_set, sigma, ard_weights=ard_weights)
+
+    def _compute_local_patch_neighbors(self, patch, center):
+        local_k = min(max(1, getattr(self.args, "mmd_local_k", 7)), patch.shape[0])
+        if center is not None:
+            center = center.squeeze(0) if center.dim() == 3 else center
+            patch_distance = torch.cdist(center, center)
+        else:
+            patch_distance = torch.cdist(patch, patch)
+
+        _, local_indices = torch.topk(patch_distance, k=local_k, largest=False, dim=1)
+        return local_indices
+
+    def _normalize_mmd_scores(self, scores):
+        norm_mode = getattr(self.args, "mmd_norm", "zscore").lower()
+        if norm_mode == "none":
+            return scores
+
+        if norm_mode == "minmax":
+            score_min = scores.min()
+            score_max = scores.max()
+            denom = (score_max - score_min).clamp_min(1e-6)
+            return (scores - score_min) / denom
+
+        mean = scores.mean()
+        std = scores.std(unbiased=False).clamp_min(1e-6)
+        normalized = (scores - mean) / std
+        return torch.relu(normalized)
+
+    def _compute_local_mmd_scores(self, patch, center):
+        local_indices = self._compute_local_patch_neighbors(patch, center)
+        local_patch_sets = patch[local_indices]
+
+        ref_k = min(max(1, getattr(self.args, "mmd_ref_k", 8)), self.patch_lib.shape[0])
+        ref_distances = torch.cdist(patch, self.patch_lib)
+        _, ref_indices = torch.topk(ref_distances, k=ref_k, largest=False, dim=1)
+        reference_sets = self.patch_lib[ref_indices]
+
+        sigma = self._estimate_mmd_sigma(
+            local_patch_sets.reshape(-1, local_patch_sets.shape[-1]),
+            reference_sets.reshape(-1, reference_sets.shape[-1]),
+        )
+
+        ard_weights = None
+        if getattr(self.args, "mmd_kernel", "rbf").lower() == "ard_rbf":
+            ard_weights = self._compute_ard_weights(local_patch_sets, reference_sets)
+
+        k_xx = self._compute_kernel(local_patch_sets, local_patch_sets, sigma, ard_weights=ard_weights)
+        k_yy = self._compute_kernel(reference_sets, reference_sets, sigma, ard_weights=ard_weights)
+        k_xy = self._compute_kernel(local_patch_sets, reference_sets, sigma, ard_weights=ard_weights)
+
+        mmd_sq = k_xx.mean(dim=(1, 2)) + k_yy.mean(dim=(1, 2)) - 2.0 * k_xy.mean(dim=(1, 2))
+        return torch.sqrt(torch.clamp(mmd_sq, min=0.0) + 1e-12)
+
 
     def compute_anomay_scores(self, patch, mask, label, path, unorganized_pc, unorganized_pc_no_zeros, center):
 
         feature_map_dims = patch.shape[0]
-        patch_scores = self._compute_patch_matching_scores(patch)
+        matching_mode = getattr(self.args, "matching_mode", "1nn").lower()
+        mmd_mode = getattr(self.args, "mmd_mode", "global").lower()
+        local_matching_mode = (
+            getattr(self.args, "mmd_base_matching_mode", "adaptive_knn").lower()
+            if matching_mode == "mmd"
+            else matching_mode
+        )
+        patch_scores = self._compute_patch_matching_scores(patch, matching_mode=local_matching_mode)
+
+        if matching_mode == "mmd" and mmd_mode == "local":
+            local_mmd_scores = self._compute_local_mmd_scores(patch, center)
+            local_mmd_scores = self._normalize_mmd_scores(local_mmd_scores)
+            patch_blend = max(getattr(self.args, "mmd_patch_blend", 0.3), 0.0)
+            patch_scores = patch_scores + patch_blend * local_mmd_scores
+
         s_map = patch_scores.view(1, 1, feature_map_dims)
 
 
@@ -290,16 +530,12 @@ class Features(torch.nn.Module):
                 s_map = torch.Tensor(self.unorganized_data_to_organized(unorganized_pc, [s_map])[0]).to(self.args.device)
 
         s_map = s_map.squeeze(0)
-        s = torch.max(s_map)
+        s = self._compute_image_level_score(s_map)
 
-        if self.args.dataset == 'real':
-            s = torch.mean(s_map)
-        if self.args.dataset == 'shapenet':
-            tmp_s,_ = torch.topk(s_map, 80)
-            s = torch.mean(tmp_s)
-        if self.args.dataset == 'mulsen' or self.args.dataset == 'minishift' or self.args.dataset == 'quan':
-            tmp_s,_ = torch.topk(s_map, 80)
-            s = torch.mean(tmp_s)
+        if matching_mode == "mmd" and mmd_mode == "global":
+            mmd_score = self._compute_mmd_matching_score(patch, patch_scores)
+            blend = float(np.clip(getattr(self.args, "mmd_blend", 0.3), 0.0, 1.0))
+            s = (1.0 - blend) * s + blend * mmd_score
         
 
         if self.args.vis_save:
