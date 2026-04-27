@@ -97,3 +97,128 @@
 
 如果你愿意，我下一步就直接帮你选一个最合适的方向落代码。  
 我建议先做：**Joint Local-Global Memory Bank**。
+
+
+
+
+1. 边界感知的 point-level refinement
+最推荐，性价比最高。
+
+思路：
+
+对每个点看它周围点的：
+空间距离
+法向差异
+分数差异
+在几何连续区域内平滑分数
+在边界/高曲率/法向突变处抑制平滑
+效果目标：
+
+减少噪点
+保住异常边界
+提升 pixel-level
+这会比继续调核函数更直接。
+
+2. patch-to-point 插值方式升级
+你现在的问题很可能有一部分就出在这里。
+
+可以把当前比较粗的插值，改成：
+
+距离加权
+法向一致性加权
+异常不确定性加权
+也就是：
+不是所有 patch 对 point 的贡献都一样。
+
+这一步很适合你当前代码结构，也很可能直接改善 P-ROC。
+
+3. point-level uncertainty gate
+你现在 gate 是 patch-level 的。
+后面可以进一步做：
+
+patch-level 先给出 coarse anomaly
+point-level 再根据局部不确定性决定修正强度
+这比继续全局统一调 gate 更贴近最终目标。
+
+
+
+
+方案 A：Point-level Geometric Refinement
+在 s_map 之后做：
+
+空间邻域聚合
+法向一致性约束
+分数边界保护
+这更像“几何引导的点级细化”。
+
+方案 B：Pseudo-offset inspired correction
+不用训练 offset 网络，而是用局部几何统计近似“偏移程度”：
+
+点到局部切平面距离
+点到邻域均值位置偏差
+法向不一致程度
+再把这些量作为 point-level refinement 的权重。
+
+这样你借到了 PO3AD 的核心思想：
+异常点偏离正常局部结构
+但不必把整个训练框架搬进来。
+
+如果你愿意接受训练
+那当然可以进一步往真正的 PO3AD 路线走：
+
+加一个轻量 point offset head
+用正常样本 + 伪异常训练
+再把输出接到当前 point-level score refinement
+
+
+
+
+方案 1：在 patch center 上做 refinement
+把当前 point refine 的输入从：
+
+unorganized_pc_no_zeros
+s_map
+改成：
+
+center
+patch_scores
+流程变成：
+
+对 patch center 做 KNN
+在 patch center 邻域上估计局部几何
+计算 patch-level refinement map
+修正 patch_scores
+再像现在一样插值成 s_map
+优点
+速度会快很多
+和当前主线最一致
+很可能还能保住你现在的收益
+我最推荐这个
+方案 2：只对高风险点做 point refine
+也就是不是所有点都 refine，而是只 refine：
+
+高 anomaly score 的点
+或高 uncertainty 的点
+或 top 20% 的候选异常点
+优点
+更省时间
+更贴近“只修正需要修正的地方”
+缺点
+实现会比方案 1 稍复杂一点
+方案 3：保留 point-level，但简化几何项
+现在你同时用了：
+
+plane deviation
+normal inconsistency
+可以先简化成只保留一个，比如：
+
+只用 plane
+或只用 normal
+这样会少掉一部分计算。
+
+优点
+改动小
+适合快速验证
+缺点
+提速有限，不如方案 1 明显
+CUDA_VISIBLE_DEVICES=5 python main.py --dataset minishift --category piggy --feature FPFH --num_group 4096 --group_size 128 --max_nn 40 --use_LFSA True --use_MSND True --num_MSND 2 --matching_mode mmd --mmd_mode local --mmd_base_matching_mode adaptive_knn --mmd_kernel ard_rbf --mmd_local_k 5 --mmd_ref_k 12 --mmd_sigma 1.0 --mmd_patch_blend 0.05 --mmd_norm zscore --ard_temperature 1.0 --ard_eps 1e-6 --ard_weight_norm softmax --use_uncertainty_gate True --gate_mode consistency --gate_temperature 1.5 --gate_min 0.0 --gate_max 0.7 --use_point_refine False --use_patch_center_refine False --use_boundary_aware_interp False --use_residual_sharpen True --residual_sharpen_k 8 --residual_sharpen_chunk_size 4096 --residual_sharpen_lambda 0.1 --residual_sharpen_positive_only True --expname minishift_fpfh_localmmd_ard_gate_rsharp_k8_piggy --level ALL --vis_save False

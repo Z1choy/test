@@ -222,6 +222,19 @@ class Features(torch.nn.Module):
             neighbor_scale_bank=neighbor_scale_bank,
         )
 
+    def _get_knn_distances_and_indices(
+        self,
+        query,
+        memory_bank,
+        k,
+    ):
+        dist = torch.cdist(query, memory_bank)
+        k = min(k, memory_bank.shape[0])
+        if k <= 0:
+            raise ValueError("k must be positive for kNN retrieval.")
+        knn_distances, knn_indices = torch.topk(dist, k=k, largest=False, dim=1)
+        return knn_distances, knn_indices
+
     def _build_patch_library_statistics(self):
         matching_mode = getattr(self.args, "matching_mode", "1nn").lower()
         mmd_base_matching_mode = getattr(self.args, "mmd_base_matching_mode", "1nn").lower()
@@ -240,9 +253,22 @@ class Features(torch.nn.Module):
             return
 
         with torch.no_grad():
-            lib_dist = torch.cdist(self.patch_lib, self.patch_lib)
-            lib_dist.fill_diagonal_(float("inf"))
-            neighbor_distances, _ = torch.topk(lib_dist, k=density_k, largest=False, dim=1)
+            search_k = min(self.patch_lib.shape[0], density_k + 1)
+            knn = KNN(k=search_k, transpose_mode=True)
+            neighbor_distances, _ = knn(
+                self.patch_lib.unsqueeze(0).contiguous(),
+                self.patch_lib.unsqueeze(0).contiguous(),
+            )
+            neighbor_distances = neighbor_distances.squeeze(0)
+
+            # Self-matching appears as the closest item with zero distance; exclude it.
+            if neighbor_distances.shape[1] > 1:
+                neighbor_distances = neighbor_distances[:, 1:]
+
+            if neighbor_distances.shape[1] == 0:
+                self.patch_lib_neighbor_scale = None
+                return
+
             self.patch_lib_neighbor_scale = neighbor_distances.mean(dim=1).clamp_min(1e-6)
 
     def _compute_patch_matching_scores(self, patch, matching_mode=None):
@@ -256,6 +282,304 @@ class Features(torch.nn.Module):
             max(getattr(self.args, "matching_consistency_weight", 0.5), 0.0),
             neighbor_scale_bank=self.patch_lib_neighbor_scale,
         )
+
+    def _compute_patch_uncertainty(self, patch, matching_mode=None):
+        matching_mode = getattr(self.args, "matching_mode", "1nn").lower() if matching_mode is None else matching_mode
+        gate_mode = getattr(self.args, "gate_mode", "consistency").lower()
+
+        if gate_mode != "consistency":
+            return torch.zeros(patch.shape[0], device=patch.device, dtype=patch.dtype)
+
+        gate_k = max(2, getattr(self.args, "matching_k", 5))
+        knn_distances, _ = self._get_knn_distances_and_indices(patch, self.patch_lib, gate_k)
+
+        if knn_distances.shape[1] < 2:
+            return torch.zeros(patch.shape[0], device=patch.device, dtype=patch.dtype)
+
+        uncertainty = knn_distances.std(dim=1, unbiased=False) / knn_distances.mean(dim=1).clamp_min(1e-6)
+        if matching_mode == "adaptive_knn" and self.patch_lib_neighbor_scale is not None:
+            # Keep uncertainty aligned with adaptive matching behavior by lightly normalizing by local density.
+            neighbor_distances, neighbor_indices = self._get_knn_distances_and_indices(patch, self.patch_lib, min(gate_k, self.patch_lib.shape[0]))
+            neighbor_scale = self.patch_lib_neighbor_scale[neighbor_indices].mean(dim=1)
+            uncertainty = uncertainty / neighbor_scale.clamp_min(1e-6)
+
+        return uncertainty
+
+    def _normalize_gate(self, uncertainty_scores):
+        gate_min = float(np.clip(getattr(self.args, "gate_min", 0.0), 0.0, 1.0))
+        gate_max = float(np.clip(getattr(self.args, "gate_max", 1.0), 0.0, 1.0))
+        if gate_max < gate_min:
+            gate_min, gate_max = gate_max, gate_min
+
+        if uncertainty_scores.numel() == 0:
+            return uncertainty_scores
+
+        std = uncertainty_scores.std(unbiased=False)
+        if std.item() < 1e-6:
+            gate = torch.full_like(uncertainty_scores, (gate_min + gate_max) * 0.5)
+            return gate
+
+        temperature = max(float(getattr(self.args, "gate_temperature", 1.0)), 1e-6)
+        z_scores = (uncertainty_scores - uncertainty_scores.mean()) / std.clamp_min(1e-6)
+        gate = torch.sigmoid(z_scores / temperature)
+        gate = gate * (gate_max - gate_min) + gate_min
+        return gate.clamp(gate_min, gate_max)
+
+    def _fuse_patch_scores_with_gate(self, base_patch_scores, mmd_residual, gate):
+        blend = max(float(getattr(self.args, "mmd_patch_blend", 0.3)), 0.0)
+        return base_patch_scores + gate * blend * mmd_residual
+
+    def _normalize_auxiliary_scores(self, scores):
+        if scores.numel() == 0:
+            return scores
+        score_min = scores.min()
+        score_max = scores.max()
+        if (score_max - score_min).item() < 1e-6:
+            return torch.zeros_like(scores)
+        return (scores - score_min) / (score_max - score_min)
+
+    def _compute_patch_confidence(self, patch, matching_mode):
+        if not getattr(self.args, "interp_use_confidence", True):
+            return torch.ones(patch.shape[0], device=patch.device, dtype=patch.dtype)
+
+        uncertainty = self._compute_patch_uncertainty(patch, matching_mode=matching_mode)
+        if uncertainty.numel() == 0:
+            return torch.ones(patch.shape[0], device=patch.device, dtype=patch.dtype)
+
+        uncertainty = self._normalize_auxiliary_scores(uncertainty)
+        confidence_weight = max(float(getattr(self.args, "interp_confidence_weight", 1.0)), 0.0)
+        return torch.exp(-confidence_weight * uncertainty)
+
+    def _boundary_aware_interpolate_scores(self, points, centers, center_scores, center_confidence=None):
+        batch_size, num_points, _ = points.shape
+        _, num_centers, _ = centers.shape
+        if num_points == 0 or num_centers == 0:
+            return torch.zeros((batch_size, num_points, 1), device=points.device, dtype=points.dtype)
+
+        interp_k = min(max(1, getattr(self.args, "interp_k", 8)), num_centers)
+        chunk_size = max(int(getattr(self.args, "interp_chunk_size", 4096)), 1)
+        dist_sigma = max(float(getattr(self.args, "interp_dist_sigma", 0.05)), 1e-6)
+
+        if center_scores.dim() == 1:
+            center_scores = center_scores.unsqueeze(0)
+        if center_confidence is None:
+            center_confidence = torch.ones_like(center_scores)
+        elif center_confidence.dim() == 1:
+            center_confidence = center_confidence.unsqueeze(0)
+
+        knn = KNN(k=interp_k, transpose_mode=True)
+        reference_centers = centers.contiguous()
+        flat_scores = center_scores.reshape(batch_size * num_centers, 1)
+        flat_confidence = center_confidence.reshape(batch_size * num_centers, 1)
+        point_chunks = []
+
+        for start in range(0, num_points, chunk_size):
+            end = min(start + chunk_size, num_points)
+            query_points = points[:, start:end, :].contiguous()
+            distances, indices = knn(reference_centers, query_points)
+
+            idx_base = torch.arange(batch_size, device=points.device).view(-1, 1, 1) * num_centers
+            flat_indices = (indices + idx_base).reshape(-1)
+
+            neighbor_scores = flat_scores[flat_indices].reshape(batch_size, end - start, interp_k, 1)
+            neighbor_conf = flat_confidence[flat_indices].reshape(batch_size, end - start, interp_k, 1)
+
+            distance_weights = torch.exp(-distances.unsqueeze(-1) / dist_sigma)
+            weights = distance_weights * neighbor_conf
+            denom = weights.sum(dim=2, keepdim=False).clamp_min(1e-6)
+            interpolated = (weights * neighbor_scores).sum(dim=2) / denom
+            point_chunks.append(interpolated)
+
+        return torch.cat(point_chunks, dim=1)
+
+    def _compute_residual_sharpen_neighbors(self, points):
+        num_points = points.shape[0]
+        if num_points <= 1:
+            return torch.zeros((num_points, 1), device=points.device, dtype=torch.long)
+
+        neighbor_k = min(max(2, getattr(self.args, "residual_sharpen_k", 16)), num_points)
+        chunk_size = max(int(getattr(self.args, "residual_sharpen_chunk_size", 4096)), 1)
+
+        knn = KNN(k=neighbor_k, transpose_mode=True)
+        reference_points = points.unsqueeze(0).contiguous()
+        neighbor_idx_chunks = []
+
+        for start in range(0, num_points, chunk_size):
+            end = min(start + chunk_size, num_points)
+            query_points = points[start:end].unsqueeze(0).contiguous()
+            _, chunk_idx = knn(reference_points, query_points)
+            neighbor_idx_chunks.append(chunk_idx.squeeze(0).long())
+
+        return torch.cat(neighbor_idx_chunks, dim=0)
+
+    def _apply_residual_sharpening(self, s_map, unorganized_pc_no_zeros):
+        if unorganized_pc_no_zeros is None:
+            return s_map
+
+        points = unorganized_pc_no_zeros.squeeze(0) if unorganized_pc_no_zeros.dim() == 3 else unorganized_pc_no_zeros
+        flat_scores = s_map.reshape(-1)
+        if points.shape[0] != flat_scores.shape[0] or points.shape[0] < 3:
+            return s_map
+
+        neighbor_idx = self._compute_residual_sharpen_neighbors(points.to(s_map.device))
+        neighborhood_scores = flat_scores[neighbor_idx]
+        local_smooth = neighborhood_scores.mean(dim=1)
+
+        residual = flat_scores - local_smooth
+        if getattr(self.args, "residual_sharpen_positive_only", True):
+            residual = torch.relu(residual)
+
+        sharpen_lambda = max(float(getattr(self.args, "residual_sharpen_lambda", 0.1)), 0.0)
+        sharpened_scores = flat_scores + sharpen_lambda * residual
+        return sharpened_scores.reshape_as(s_map)
+
+    def _compute_point_neighbors(self, points):
+        num_points = points.shape[0]
+        if num_points <= 1:
+            return torch.zeros((num_points, 1), device=points.device, dtype=torch.long)
+
+        neighbor_k = min(max(2, getattr(self.args, "point_refine_k", 16)), num_points)
+        chunk_size = max(int(getattr(self.args, "point_refine_chunk_size", 4096)), 1)
+
+        # Query neighbors in chunks so we avoid a large all-points-at-once kNN allocation.
+        knn = KNN(k=neighbor_k, transpose_mode=True)
+        reference_points = points.unsqueeze(0).contiguous()
+        neighbor_idx_chunks = []
+
+        for start in range(0, num_points, chunk_size):
+            end = min(start + chunk_size, num_points)
+            query_points = points[start:end].unsqueeze(0).contiguous()
+            _, chunk_idx = knn(reference_points, query_points)
+            neighbor_idx_chunks.append(chunk_idx.squeeze(0).long())
+
+        return torch.cat(neighbor_idx_chunks, dim=0)
+
+    def _estimate_point_normals(self, points, neighbor_idx):
+        neighborhoods = points[neighbor_idx]
+        centroids = neighborhoods.mean(dim=1, keepdim=True)
+        centered = neighborhoods - centroids
+        covariance = torch.matmul(centered.transpose(1, 2), centered) / max(neighborhoods.shape[1], 1)
+        eye = torch.eye(3, device=points.device, dtype=points.dtype).unsqueeze(0)
+        covariance = covariance + 1e-6 * eye
+        _, eigenvectors = torch.linalg.eigh(covariance)
+        normals = eigenvectors[:, :, 0]
+        normals = torch.nn.functional.normalize(normals, dim=-1)
+        return normals
+
+    def _compute_geometric_refinement_map(self, points):
+        neighbor_idx = self._compute_point_neighbors(points)
+        neighborhoods = points[neighbor_idx]
+        centroids = neighborhoods.mean(dim=1)
+        normals = self._estimate_point_normals(points, neighbor_idx)
+        neighbor_normals = normals[neighbor_idx]
+
+        components = []
+        weights = []
+
+        if getattr(self.args, "point_refine_use_plane", True):
+            plane_dev = torch.abs(((points - centroids) * normals).sum(dim=1))
+            components.append(self._normalize_auxiliary_scores(plane_dev))
+            weights.append(max(float(getattr(self.args, "point_refine_plane_weight", 1.0)), 0.0))
+
+        if getattr(self.args, "point_refine_use_normal", True):
+            cosine = torch.abs((normals.unsqueeze(1) * neighbor_normals).sum(dim=-1)).clamp(0.0, 1.0)
+            normal_dev = 1.0 - cosine.mean(dim=1)
+            components.append(self._normalize_auxiliary_scores(normal_dev))
+            weights.append(max(float(getattr(self.args, "point_refine_normal_weight", 1.0)), 0.0))
+
+        if getattr(self.args, "point_refine_use_centroid", False):
+            centroid_dev = torch.linalg.norm(points - centroids, dim=1)
+            components.append(self._normalize_auxiliary_scores(centroid_dev))
+            weights.append(max(float(getattr(self.args, "point_refine_centroid_weight", 0.5)), 0.0))
+
+        if not components:
+            return torch.zeros(points.shape[0], device=points.device, dtype=points.dtype)
+
+        stacked = torch.stack(components, dim=0)
+        weight_tensor = torch.tensor(weights, device=points.device, dtype=points.dtype).view(-1, 1)
+        weight_sum = weight_tensor.sum().clamp_min(1e-6)
+        refinement_map = (stacked * weight_tensor).sum(dim=0) / weight_sum
+        return self._normalize_auxiliary_scores(refinement_map)
+
+    def _refine_point_scores_with_geometry(self, s_map, unorganized_pc_no_zeros):
+        if unorganized_pc_no_zeros is None:
+            return s_map
+
+        points = unorganized_pc_no_zeros.squeeze(0) if unorganized_pc_no_zeros.dim() == 3 else unorganized_pc_no_zeros
+        flat_scores = s_map.reshape(-1)
+        if points.shape[0] != flat_scores.shape[0] or points.shape[0] < 3:
+            return s_map
+
+        refinement_map = self._compute_geometric_refinement_map(points.to(s_map.device))
+        refine_lambda = max(float(getattr(self.args, "point_refine_lambda", 0.1)), 0.0)
+        refined_scores = flat_scores * (1.0 + refine_lambda * refinement_map)
+        return refined_scores.reshape_as(s_map)
+
+    def _compute_center_neighbors(self, centers):
+        num_centers = centers.shape[0]
+        if num_centers <= 1:
+            return torch.zeros((num_centers, 1), device=centers.device, dtype=torch.long)
+
+        neighbor_k = min(max(2, getattr(self.args, "patch_center_refine_k", 16)), num_centers)
+        knn = KNN(k=neighbor_k, transpose_mode=True)
+        _, neighbor_idx = knn(centers.unsqueeze(0).contiguous(), centers.unsqueeze(0).contiguous())
+        return neighbor_idx.squeeze(0).long()
+
+    def _estimate_center_normals(self, centers, neighbor_idx):
+        neighborhoods = centers[neighbor_idx]
+        centroids = neighborhoods.mean(dim=1, keepdim=True)
+        centered = neighborhoods - centroids
+        covariance = torch.matmul(centered.transpose(1, 2), centered) / max(neighborhoods.shape[1], 1)
+        eye = torch.eye(3, device=centers.device, dtype=centers.dtype).unsqueeze(0)
+        covariance = covariance + 1e-6 * eye
+        _, eigenvectors = torch.linalg.eigh(covariance)
+        normals = eigenvectors[:, :, 0]
+        normals = torch.nn.functional.normalize(normals, dim=-1)
+        return normals
+
+    def _compute_patch_geometric_refinement_map(self, centers):
+        neighbor_idx = self._compute_center_neighbors(centers)
+        neighborhoods = centers[neighbor_idx]
+        centroids = neighborhoods.mean(dim=1)
+        normals = self._estimate_center_normals(centers, neighbor_idx)
+        neighbor_normals = normals[neighbor_idx]
+
+        components = []
+        weights = []
+
+        if getattr(self.args, "patch_center_refine_use_plane", True):
+            plane_dev = torch.abs(((centers - centroids) * normals).sum(dim=1))
+            components.append(self._normalize_auxiliary_scores(plane_dev))
+            weights.append(max(float(getattr(self.args, "patch_center_refine_plane_weight", 1.0)), 0.0))
+
+        if getattr(self.args, "patch_center_refine_use_normal", True):
+            cosine = torch.abs((normals.unsqueeze(1) * neighbor_normals).sum(dim=-1)).clamp(0.0, 1.0)
+            normal_dev = 1.0 - cosine.mean(dim=1)
+            components.append(self._normalize_auxiliary_scores(normal_dev))
+            weights.append(max(float(getattr(self.args, "patch_center_refine_normal_weight", 1.0)), 0.0))
+
+        if not components:
+            return torch.zeros(centers.shape[0], device=centers.device, dtype=centers.dtype)
+
+        stacked = torch.stack(components, dim=0)
+        weight_tensor = torch.tensor(weights, device=centers.device, dtype=centers.dtype).view(-1, 1)
+        weight_sum = weight_tensor.sum().clamp_min(1e-6)
+        refinement_map = (stacked * weight_tensor).sum(dim=0) / weight_sum
+        return self._normalize_auxiliary_scores(refinement_map)
+
+    def _refine_patch_scores_with_geometry(self, patch_scores, center):
+        if center is None:
+            return patch_scores
+
+        centers = center.squeeze(0) if center.dim() == 3 else center
+        flat_scores = patch_scores.reshape(-1)
+        if centers.shape[0] != flat_scores.shape[0] or centers.shape[0] < 3:
+            return patch_scores
+
+        refinement_map = self._compute_patch_geometric_refinement_map(centers.to(patch_scores.device))
+        refine_lambda = max(float(getattr(self.args, "patch_center_refine_lambda", 0.1)), 0.0)
+        refined_scores = flat_scores * (1.0 + refine_lambda * refinement_map)
+        return refined_scores.reshape_as(patch_scores)
 
     def _compute_image_level_score(self, s_map):
         s = torch.max(s_map)
@@ -488,18 +812,36 @@ class Features(torch.nn.Module):
             else matching_mode
         )
         patch_scores = self._compute_patch_matching_scores(patch, matching_mode=local_matching_mode)
+        uncertainty_scores = None
 
         if matching_mode == "mmd" and mmd_mode == "local":
             local_mmd_scores = self._compute_local_mmd_scores(patch, center)
             local_mmd_scores = self._normalize_mmd_scores(local_mmd_scores)
-            patch_blend = max(getattr(self.args, "mmd_patch_blend", 0.3), 0.0)
-            patch_scores = patch_scores + patch_blend * local_mmd_scores
+            if getattr(self.args, "use_uncertainty_gate", False):
+                uncertainty_scores = self._compute_patch_uncertainty(patch, matching_mode=local_matching_mode)
+                gate = self._normalize_gate(uncertainty_scores)
+                patch_scores = self._fuse_patch_scores_with_gate(patch_scores, local_mmd_scores, gate)
+            else:
+                patch_blend = max(getattr(self.args, "mmd_patch_blend", 0.3), 0.0)
+                patch_scores = patch_scores + patch_blend * local_mmd_scores
+
+        if getattr(self.args, "use_patch_center_refine", False) and self.args.dataset not in ('mvtec', 'eyecandies'):
+            patch_scores = self._refine_patch_scores_with_geometry(patch_scores, center)
 
         s_map = patch_scores.view(1, 1, feature_map_dims)
 
 
         if self.args.use_LFSA:
-            s_map = interpolating_points_chunked(unorganized_pc_no_zeros.permute(0,2,1).to(self.args.device), center.permute(0,2,1).to(self.args.device), s_map.to(self.args.device)).permute(0,2,1)
+            if getattr(self.args, "use_boundary_aware_interp", False) and self.args.dataset not in ('mvtec', 'eyecandies'):
+                patch_confidence = self._compute_patch_confidence(patch, matching_mode=local_matching_mode)
+                s_map = self._boundary_aware_interpolate_scores(
+                    unorganized_pc_no_zeros.to(self.args.device),
+                    center.to(self.args.device),
+                    patch_scores.to(self.args.device),
+                    patch_confidence.to(self.args.device),
+                ).permute(0, 2, 1)
+            else:
+                s_map = interpolating_points_chunked(unorganized_pc_no_zeros.permute(0,2,1).to(self.args.device), center.permute(0,2,1).to(self.args.device), s_map.to(self.args.device)).permute(0,2,1)
             s_map = torch.Tensor(self.unorganized_data_to_organized(unorganized_pc, [s_map])[0]).to(self.args.device)
 
             if self.args.dataset == 'mvtec' or self.args.dataset == 'eyecandies':
@@ -526,10 +868,22 @@ class Features(torch.nn.Module):
                 neighborhood = neighborhood.reshape(batch_size, num_group, group_size, -1).contiguous()
                 agg_s_map = torch.mean(neighborhood,-2).view(1, 1, -1)
 
-                s_map = interpolating_points_chunked(unorganized_pc_no_zeros.permute(0,2,1).to(self.args.device), center.permute(0,2,1).to(self.args.device), agg_s_map.to(self.args.device)).permute(0,2,1)
+                if getattr(self.args, "use_boundary_aware_interp", False):
+                    s_map = self._boundary_aware_interpolate_scores(
+                        unorganized_pc_no_zeros.to(self.args.device),
+                        center.to(self.args.device),
+                        agg_s_map.view(batch_size, -1).to(self.args.device),
+                        None,
+                    ).permute(0, 2, 1)
+                else:
+                    s_map = interpolating_points_chunked(unorganized_pc_no_zeros.permute(0,2,1).to(self.args.device), center.permute(0,2,1).to(self.args.device), agg_s_map.to(self.args.device)).permute(0,2,1)
                 s_map = torch.Tensor(self.unorganized_data_to_organized(unorganized_pc, [s_map])[0]).to(self.args.device)
 
         s_map = s_map.squeeze(0)
+        if getattr(self.args, "use_point_refine", False) and self.args.dataset not in ('mvtec', 'eyecandies'):
+            s_map = self._refine_point_scores_with_geometry(s_map, unorganized_pc_no_zeros)
+        if getattr(self.args, "use_residual_sharpen", False) and self.args.dataset not in ('mvtec', 'eyecandies'):
+            s_map = self._apply_residual_sharpening(s_map, unorganized_pc_no_zeros)
         s = self._compute_image_level_score(s_map)
 
         if matching_mode == "mmd" and mmd_mode == "global":
