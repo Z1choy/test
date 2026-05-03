@@ -222,3 +222,92 @@ normal inconsistency
 缺点
 提速有限，不如方案 1 明显
 CUDA_VISIBLE_DEVICES=5 python main.py --dataset minishift --category piggy --feature FPFH --num_group 4096 --group_size 128 --max_nn 40 --use_LFSA True --use_MSND True --num_MSND 2 --matching_mode mmd --mmd_mode local --mmd_base_matching_mode adaptive_knn --mmd_kernel ard_rbf --mmd_local_k 5 --mmd_ref_k 12 --mmd_sigma 1.0 --mmd_patch_blend 0.05 --mmd_norm zscore --ard_temperature 1.0 --ard_eps 1e-6 --ard_weight_norm softmax --use_uncertainty_gate True --gate_mode consistency --gate_temperature 1.5 --gate_min 0.0 --gate_max 0.7 --use_point_refine False --use_patch_center_refine False --use_boundary_aware_interp False --use_residual_sharpen True --residual_sharpen_k 8 --residual_sharpen_chunk_size 4096 --residual_sharpen_lambda 0.1 --residual_sharpen_positive_only True --expname minishift_fpfh_localmmd_ard_gate_rsharp_k8_piggy --level ALL --vis_save False
+
+
+
+
+
+
+
+
+
+
+
+
+Point Offset Head
+来源：PO3AD, CVPR 2025
+链接：https://openaccess.thecvf.com/content/CVPR2025/html/Ye_PO3AD_Predicting_Point_Offsets_toward_Better_3D_Point_Cloud_Anomaly_CVPR_2025_paper.html
+可加模块：
+
+一个很轻的 point refinement head
+输入你当前的 s_map、点坐标、局部几何量
+输出 point-wise delta_map
+为什么最适合你：
+它直接针对点级异常偏移
+最贴近你现在“image-level 已经够强，pixel-level 还差最后一步”的状态
+优先级：最高
+Internal Spatial Modality Perception + Feature Filtering
+来源：ISMP, AAAI 2025
+链接：https://doi.org/10.1609/aaai.v39i5.32546
+可借鉴模块：
+
+Spatial Insight Engine
+feature filtering module
+适合接入：
+放在你 current patch features 或 patch scores 后面，做一次结构感知过滤
+价值：
+这篇工作报告了比较明显的 point-level 提升
+很适合做一个“只在局部结构显著区域增强”的 refinement 分支
+优先级：高
+Adaptive Geometry-aware Masked Attention / Local Geometry-aware Encoder
+来源：MC3D-AD, IJCAI 2025
+链接：https://www.ijcai.org/proceedings/2025/94
+可借鉴模块：
+
+geometry-aware attention
+local geometry-aware encoder
+适合接入：
+如果你愿意改特征提取阶段，而不是只做后处理
+价值：
+更偏训练式 feature enhancement
+可能同时带动 object-level 和 point-level
+优先级：中高
+如果你还想尽量少改、或者先做半步过渡
+4. Curvature-Guided Center-Point Local Branch
+来源：Template3D-AD, IJCAI 2025
+链接：https://www.ijcai.org/proceedings/2025/182
+可借鉴模块：
+
+center-point template matching
+curvature-based local feature representation
+适合接入：
+你现在已经有 center 和 patch 结构，很好接
+价值：
+比继续做 generic sharpening 更可能直接帮助 pixel-level
+改动比训练 head 小
+优先级：高
+Geometry-aware Sampling Module
+来源：IMRNet, CVPR 2024
+链接：https://openaccess.thecvf.com/content/CVPR2024/html/Li_Towards_Scalable_3D_Anomaly_Detection_and_Localization_A_Benchmark_via_CVPR_2024_paper.html
+可借鉴模块：
+
+geometry-aware point cloud sampling
+dense feature comparison
+适合接入：
+替换你现有的 patch center / group 构造策略
+价值：
+这更可能提升“异常区域是否被采到”
+会间接提升 P-ROC
+优先级：中高
+Tangent-plane / Edge-aware Interpolation
+来源：
+
+PointSP, IJCAI 2025：https://www.ijcai.org/proceedings/2025/48
+IE-PMMA, IJCAI 2025：https://www.ijcai.org/proceedings/2025/138
+说明：
+这两篇不是 3D AD 论文，但都强调局部几何保真、边缘/切平面信息
+很适合借鉴到你 patch_scores -> s_map 这一步
+价值：
+比你之前那版简单 confidence interpolation 更靠谱
+但更适合作为辅助，不像 PO3AD 那样是主突破点
+优先级：中

@@ -21,6 +21,7 @@ import open3d as o3d
 # from feature_extractors.models import *
 from torch.utils.data import DataLoader
 from knn_cuda import KNN
+from models.point_offset_head import PointOffsetHead
 
 def fps(data, number):
     '''
@@ -144,6 +145,10 @@ class Features(torch.nn.Module):
         self.image_rocauc = 0
         self.pixel_rocauc = 0
         self.au_pro = 0
+        self.point_offset_head = None
+        self.point_offset_optimizer = None
+        if getattr(self.args, "use_point_offset_head", False):
+            self._init_point_offset_head()
 
     def __call__(self, x):
         # Extract the desired feature maps using the backbone model.
@@ -169,6 +174,25 @@ class Features(torch.nn.Module):
         self.image_rocauc = 0
         self.pixel_rocauc = 0
         self.au_pro = 0
+
+    def _get_point_offset_input_dim(self):
+        input_dim = 6  # xyz + base score + local mean + local residual
+        if getattr(self.args, "point_offset_use_plane", True):
+            input_dim += 1
+        if getattr(self.args, "point_offset_use_normal", True):
+            input_dim += 1
+        if getattr(self.args, "point_offset_use_centroid", False):
+            input_dim += 1
+        return input_dim
+
+    def _init_point_offset_head(self):
+        input_dim = self._get_point_offset_input_dim()
+        hidden_dim = max(int(getattr(self.args, "point_offset_hidden_dim", 32)), 8)
+        self.point_offset_head = PointOffsetHead(input_dim, hidden_dim).to(self.args.device)
+        self.point_offset_optimizer = torch.optim.Adam(
+            self.point_offset_head.parameters(),
+            lr=max(float(getattr(self.args, "point_offset_lr", 1e-3)), 1e-6),
+        )
 
     def _reduce_knn_distances(self, knn_distances, knn_indices, matching_mode, temperature, consistency_weight, neighbor_scale_bank=None):
         if matching_mode == "knn_mean":
@@ -454,6 +478,26 @@ class Features(torch.nn.Module):
 
         return torch.cat(neighbor_idx_chunks, dim=0)
 
+    def _compute_point_offset_neighbors(self, points):
+        num_points = points.shape[0]
+        if num_points <= 1:
+            return torch.zeros((num_points, 1), device=points.device, dtype=torch.long)
+
+        neighbor_k = min(max(2, getattr(self.args, "point_offset_k", 16)), num_points)
+        chunk_size = max(int(getattr(self.args, "point_offset_chunk_size", 4096)), 1)
+
+        knn = KNN(k=neighbor_k, transpose_mode=True)
+        reference_points = points.unsqueeze(0).contiguous()
+        neighbor_idx_chunks = []
+
+        for start in range(0, num_points, chunk_size):
+            end = min(start + chunk_size, num_points)
+            query_points = points[start:end].unsqueeze(0).contiguous()
+            _, chunk_idx = knn(reference_points, query_points)
+            neighbor_idx_chunks.append(chunk_idx.squeeze(0).long())
+
+        return torch.cat(neighbor_idx_chunks, dim=0)
+
     def _estimate_point_normals(self, points, neighbor_idx):
         neighborhoods = points[neighbor_idx]
         centroids = neighborhoods.mean(dim=1, keepdim=True)
@@ -514,6 +558,134 @@ class Features(torch.nn.Module):
         refine_lambda = max(float(getattr(self.args, "point_refine_lambda", 0.1)), 0.0)
         refined_scores = flat_scores * (1.0 + refine_lambda * refinement_map)
         return refined_scores.reshape_as(s_map)
+
+    def _compute_point_geometric_components(self, points, neighbor_idx):
+        neighborhoods = points[neighbor_idx]
+        centroids = neighborhoods.mean(dim=1)
+        normals = self._estimate_point_normals(points, neighbor_idx)
+        neighbor_normals = normals[neighbor_idx]
+
+        plane_dev = torch.abs(((points - centroids) * normals).sum(dim=1))
+        cosine = torch.abs((normals.unsqueeze(1) * neighbor_normals).sum(dim=-1)).clamp(0.0, 1.0)
+        normal_dev = 1.0 - cosine.mean(dim=1)
+        centroid_dev = torch.linalg.norm(points - centroids, dim=1)
+
+        return {
+            "plane_dev": self._normalize_auxiliary_scores(plane_dev),
+            "normal_dev": self._normalize_auxiliary_scores(normal_dev),
+            "centroid_dev": self._normalize_auxiliary_scores(centroid_dev),
+        }
+
+    def _compute_dice_loss(self, prediction, target):
+        eps = 1e-6
+        intersection = torch.sum(prediction * target)
+        union = torch.sum(prediction) + torch.sum(target)
+        dice = (2.0 * intersection + eps) / (union + eps)
+        return 1.0 - dice
+
+    def _safe_logit(self, scores, eps=1e-4):
+        scores = scores.clamp(eps, 1.0 - eps)
+        return torch.log(scores / (1.0 - scores))
+
+    def _build_point_offset_inputs(self, s_map, unorganized_pc_no_zeros):
+        points = unorganized_pc_no_zeros.squeeze(0) if unorganized_pc_no_zeros.dim() == 3 else unorganized_pc_no_zeros
+        points = points.to(self.args.device)
+        flat_scores = s_map.reshape(-1).to(self.args.device)
+
+        if points.shape[0] != flat_scores.shape[0] or points.shape[0] < 3:
+            return None, None
+
+        neighbor_idx = self._compute_point_offset_neighbors(points)
+        neighborhood_scores = flat_scores[neighbor_idx]
+        local_mean = neighborhood_scores.mean(dim=1)
+        local_residual = flat_scores - local_mean
+
+        point_mean = points.mean(dim=0, keepdim=True)
+        point_std = points.std(dim=0, keepdim=True, unbiased=False).clamp_min(1e-6)
+        normalized_points = (points - point_mean) / point_std
+
+        components = [
+            normalized_points,
+            self._normalize_auxiliary_scores(flat_scores).unsqueeze(1),
+            self._normalize_auxiliary_scores(local_mean).unsqueeze(1),
+            self._normalize_auxiliary_scores(local_residual).unsqueeze(1),
+        ]
+
+        geometric_components = self._compute_point_geometric_components(points, neighbor_idx)
+        if getattr(self.args, "point_offset_use_plane", True):
+            components.append(geometric_components["plane_dev"].unsqueeze(1))
+        if getattr(self.args, "point_offset_use_normal", True):
+            components.append(geometric_components["normal_dev"].unsqueeze(1))
+        if getattr(self.args, "point_offset_use_centroid", False):
+            components.append(geometric_components["centroid_dev"].unsqueeze(1))
+
+        input_features = torch.cat(components, dim=1)
+        base_scores = self._normalize_auxiliary_scores(flat_scores)
+        return input_features, base_scores
+
+    def _apply_point_offset_head(self, s_map, unorganized_pc_no_zeros, mask=None, optimize=False):
+        if self.point_offset_head is None:
+            return None if optimize else s_map
+
+        built_inputs = self._build_point_offset_inputs(s_map, unorganized_pc_no_zeros)
+        if built_inputs[0] is None:
+            return None if optimize else s_map
+
+        input_features, base_scores = built_inputs
+        alpha = max(float(getattr(self.args, "point_offset_alpha", 0.1)), 0.0)
+
+        if optimize:
+            target = mask.reshape(-1).to(self.args.device).float()
+            return self.train_point_offset_from_tensors(input_features, base_scores, target)
+
+        self.point_offset_head.eval()
+        with torch.no_grad():
+            delta_map = self.point_offset_head(input_features).squeeze(1)
+            base_logits = self._safe_logit(base_scores)
+            refined_logits = base_logits + alpha * delta_map
+            refined_scores = torch.sigmoid(refined_logits)
+        return refined_scores.reshape_as(s_map)
+
+    def build_point_offset_training_sample_from_map(self, s_map, unorganized_pc_no_zeros, mask):
+        built_inputs = self._build_point_offset_inputs(s_map, unorganized_pc_no_zeros)
+        if built_inputs[0] is None:
+            return None
+
+        input_features, base_scores = built_inputs
+        target = mask.reshape(-1).to(self.args.device).float()
+        if target.shape[0] != base_scores.shape[0]:
+            return None
+
+        cache_device = getattr(self.args, "point_offset_cache_device", "cpu").lower()
+        if cache_device == "cuda":
+            return input_features.detach(), base_scores.detach(), target.detach()
+        return input_features.detach().cpu(), base_scores.detach().cpu(), target.detach().cpu()
+
+    def train_point_offset_from_tensors(self, input_features, base_scores, target):
+        if self.point_offset_head is None:
+            return None
+
+        input_features = input_features.to(self.args.device)
+        base_scores = base_scores.to(self.args.device)
+        target = target.to(self.args.device).float()
+        if target.shape[0] != base_scores.shape[0]:
+            return None
+
+        alpha = max(float(getattr(self.args, "point_offset_alpha", 0.1)), 0.0)
+        self.point_offset_head.train()
+        delta_map = self.point_offset_head(input_features).squeeze(1)
+        base_logits = self._safe_logit(base_scores)
+        refined_logits = base_logits + alpha * delta_map
+        refined_scores = torch.sigmoid(refined_logits)
+
+        bce_loss = torch.nn.functional.binary_cross_entropy_with_logits(refined_logits, target)
+        dice_loss = self._compute_dice_loss(refined_scores, target)
+        loss = bce_loss + dice_loss
+
+        self.point_offset_optimizer.zero_grad()
+        loss.backward()
+        self.point_offset_optimizer.step()
+        return float(loss.detach().cpu().item())
 
     def _compute_center_neighbors(self, centers):
         num_centers = centers.shape[0]
@@ -801,7 +973,7 @@ class Features(torch.nn.Module):
         return torch.sqrt(torch.clamp(mmd_sq, min=0.0) + 1e-12)
 
 
-    def compute_anomay_scores(self, patch, mask, label, path, unorganized_pc, unorganized_pc_no_zeros, center):
+    def compute_anomay_scores(self, patch, mask, label, path, unorganized_pc, unorganized_pc_no_zeros, center, optimize_point_offset=False, return_point_offset_sample=False):
 
         feature_map_dims = patch.shape[0]
         matching_mode = getattr(self.args, "matching_mode", "1nn").lower()
@@ -884,7 +1056,30 @@ class Features(torch.nn.Module):
             s_map = self._refine_point_scores_with_geometry(s_map, unorganized_pc_no_zeros)
         if getattr(self.args, "use_residual_sharpen", False) and self.args.dataset not in ('mvtec', 'eyecandies'):
             s_map = self._apply_residual_sharpening(s_map, unorganized_pc_no_zeros)
-        s = self._compute_image_level_score(s_map)
+
+        base_image_score = None
+        if getattr(self.args, "use_point_offset_head", False) and self.args.dataset not in ('mvtec', 'eyecandies'):
+            base_image_score = self._compute_image_level_score(s_map)
+
+        if getattr(self.args, "use_point_offset_head", False) and self.args.dataset not in ('mvtec', 'eyecandies'):
+            if return_point_offset_sample:
+                return self.build_point_offset_training_sample_from_map(s_map, unorganized_pc_no_zeros, mask)
+            if optimize_point_offset:
+                return self._apply_point_offset_head(s_map, unorganized_pc_no_zeros, mask=mask, optimize=True)
+            s_map = self._apply_point_offset_head(s_map, unorganized_pc_no_zeros, mask=mask, optimize=False)
+
+        refined_image_score = self._compute_image_level_score(s_map)
+        if base_image_score is not None:
+            image_mode = getattr(self.args, "point_offset_image_mode", "base").lower()
+            if image_mode == "refined":
+                s = refined_image_score
+            elif image_mode == "blend":
+                image_blend = float(np.clip(getattr(self.args, "point_offset_image_blend", 0.0), 0.0, 1.0))
+                s = (1.0 - image_blend) * base_image_score + image_blend * refined_image_score
+            else:
+                s = base_image_score
+        else:
+            s = refined_image_score
 
         if matching_mode == "mmd" and mmd_mode == "global":
             mmd_score = self._compute_mmd_matching_score(patch, patch_scores)
@@ -896,8 +1091,13 @@ class Features(torch.nn.Module):
             while isinstance(path,list):
                 path = path[0]
             from pathlib import Path
-            parts = path.split("data", 1) 
-            post_data_path = parts[1].lstrip(os.sep) 
+            path_obj = Path(path)
+            parts = path.split("data", 1)
+            if len(parts) > 1:
+                post_data_path = parts[1].lstrip(os.sep)
+            else:
+                # MiniShift paths may not contain a "data" segment; keep a compact class/type filename layout.
+                post_data_path = str(Path(path_obj.parent.name) / path_obj.name)
             save_path = "./vis-results/"+post_data_path
 
             save_dir = os.path.dirname(save_path)

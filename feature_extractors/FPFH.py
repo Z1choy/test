@@ -171,6 +171,35 @@ class FPFHFeatures(Features):
             center,
         )
 
+    def train_point_offset(self, pc, mask, path=None):
+        agg_point_feature, unorganized_pc, unorganized_pc_no_zeros, center = self.get_features(pc)
+        return self.compute_anomay_scores(
+            agg_point_feature,
+            mask,
+            None,
+            path,
+            unorganized_pc,
+            unorganized_pc_no_zeros,
+            center,
+            optimize_point_offset=True,
+        )
+
+    def build_point_offset_training_sample(self, pc, mask, path=None):
+        agg_point_feature, unorganized_pc, unorganized_pc_no_zeros, center = self.get_features(pc)
+        return self.compute_anomay_scores(
+            agg_point_feature,
+            mask,
+            None,
+            path,
+            unorganized_pc,
+            unorganized_pc_no_zeros,
+            center,
+            return_point_offset_sample=True,
+        )
+
+    def train_point_offset_from_tensors(self, input_features, base_scores, target):
+        return super().train_point_offset_from_tensors(input_features, base_scores, target)
+
 
 
  
