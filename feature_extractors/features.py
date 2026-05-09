@@ -147,6 +147,7 @@ class Features(torch.nn.Module):
         self.au_pro = 0
         self.point_offset_head = None
         self.point_offset_optimizer = None
+        self.point_offset_debug_count = 0
         if getattr(self.args, "use_point_offset_head", False):
             self._init_point_offset_head()
 
@@ -174,6 +175,7 @@ class Features(torch.nn.Module):
         self.image_rocauc = 0
         self.pixel_rocauc = 0
         self.au_pro = 0
+        self.point_offset_debug_count = 0
 
     def _get_point_offset_input_dim(self):
         input_dim = 6  # xyz + base score + local mean + local residual
@@ -188,7 +190,8 @@ class Features(torch.nn.Module):
     def _init_point_offset_head(self):
         input_dim = self._get_point_offset_input_dim()
         hidden_dim = max(int(getattr(self.args, "point_offset_hidden_dim", 32)), 8)
-        self.point_offset_head = PointOffsetHead(input_dim, hidden_dim).to(self.args.device)
+        output_activation = getattr(self.args, "point_offset_output_activation", "tanh")
+        self.point_offset_head = PointOffsetHead(input_dim, hidden_dim, output_activation=output_activation).to(self.args.device)
         self.point_offset_optimizer = torch.optim.Adam(
             self.point_offset_head.parameters(),
             lr=max(float(getattr(self.args, "point_offset_lr", 1e-3)), 1e-6),
@@ -587,6 +590,68 @@ class Features(torch.nn.Module):
         scores = scores.clamp(eps, 1.0 - eps)
         return torch.log(scores / (1.0 - scores))
 
+    def _compute_point_offset_score_gate(self, base_scores):
+        if not getattr(self.args, "point_offset_use_score_gate", False):
+            return torch.ones_like(base_scores)
+
+        gate_power = max(float(getattr(self.args, "point_offset_gate_power", 1.0)), 0.0)
+        gate = 4.0 * base_scores.clamp(0.0, 1.0) * (1.0 - base_scores.clamp(0.0, 1.0))
+        if gate_power != 1.0:
+            gate = gate.clamp_min(1e-6).pow(gate_power)
+        return gate.clamp(0.0, 1.0)
+
+    def _clamp_point_offset_delta(self, delta_map):
+        delta_clamp = float(getattr(self.args, "point_offset_delta_clamp", 0.0))
+        if delta_clamp <= 0.0:
+            return delta_map
+        return delta_map.clamp(-delta_clamp, delta_clamp)
+
+    def _center_point_offset_delta(self, delta_map):
+        if not getattr(self.args, "point_offset_center_delta", False):
+            return delta_map
+        return delta_map - delta_map.mean()
+
+    def _blend_point_offset_scores(self, base_scores, refined_scores):
+        pixel_blend = float(np.clip(getattr(self.args, "point_offset_pixel_blend", 1.0), 0.0, 1.0))
+        if pixel_blend >= 1.0:
+            return refined_scores
+        if pixel_blend <= 0.0:
+            return base_scores
+        return (1.0 - pixel_blend) * base_scores + pixel_blend * refined_scores
+
+    def _compute_point_offset_refinement(self, base_scores, delta_map, return_stats=False):
+        alpha = max(float(getattr(self.args, "point_offset_alpha", 0.1)), 0.0)
+        raw_delta = delta_map
+        delta_map = self._center_point_offset_delta(delta_map)
+        centered_delta = delta_map
+        delta_map = self._clamp_point_offset_delta(delta_map)
+        score_gate = self._compute_point_offset_score_gate(base_scores)
+        base_logits = self._safe_logit(base_scores)
+        refined_logits = base_logits + alpha * score_gate * delta_map
+        refined_scores = torch.sigmoid(refined_logits)
+        final_scores = self._blend_point_offset_scores(base_scores, refined_scores)
+        if return_stats:
+            score_change = torch.abs(final_scores - base_scores)
+            stats = {
+                "alpha": alpha,
+                "pixel_blend": float(np.clip(getattr(self.args, "point_offset_pixel_blend", 1.0), 0.0, 1.0)),
+                "delta_mean": float(torch.mean(raw_delta).detach().cpu().item()),
+                "delta_std": float(torch.std(raw_delta, unbiased=False).detach().cpu().item()),
+                "delta_abs_mean": float(torch.mean(torch.abs(raw_delta)).detach().cpu().item()),
+                "delta_abs_max": float(torch.max(torch.abs(raw_delta)).detach().cpu().item()),
+                "centered_delta_mean": float(torch.mean(centered_delta).detach().cpu().item()),
+                "centered_delta_std": float(torch.std(centered_delta, unbiased=False).detach().cpu().item()),
+                "clipped_delta_abs_mean": float(torch.mean(torch.abs(delta_map)).detach().cpu().item()),
+                "gate_mean": float(torch.mean(score_gate).detach().cpu().item()),
+                "gate_max": float(torch.max(score_gate).detach().cpu().item()),
+                "score_change_mean": float(torch.mean(score_change).detach().cpu().item()),
+                "score_change_max": float(torch.max(score_change).detach().cpu().item()),
+                "base_mean": float(torch.mean(base_scores).detach().cpu().item()),
+                "refined_mean": float(torch.mean(final_scores).detach().cpu().item()),
+            }
+            return final_scores, refined_logits, stats
+        return final_scores, refined_logits
+
     def _build_point_offset_inputs(self, s_map, unorganized_pc_no_zeros):
         points = unorganized_pc_no_zeros.squeeze(0) if unorganized_pc_no_zeros.dim() == 3 else unorganized_pc_no_zeros
         points = points.to(self.args.device)
@@ -629,10 +694,11 @@ class Features(torch.nn.Module):
 
         built_inputs = self._build_point_offset_inputs(s_map, unorganized_pc_no_zeros)
         if built_inputs[0] is None:
+            if getattr(self.args, "point_offset_debug", False):
+                print("[PointOffsetDebug] skipped: failed to build point-offset inputs.")
             return None if optimize else s_map
 
         input_features, base_scores = built_inputs
-        alpha = max(float(getattr(self.args, "point_offset_alpha", 0.1)), 0.0)
 
         if optimize:
             target = mask.reshape(-1).to(self.args.device).float()
@@ -641,9 +707,13 @@ class Features(torch.nn.Module):
         self.point_offset_head.eval()
         with torch.no_grad():
             delta_map = self.point_offset_head(input_features).squeeze(1)
-            base_logits = self._safe_logit(base_scores)
-            refined_logits = base_logits + alpha * delta_map
-            refined_scores = torch.sigmoid(refined_logits)
+            refined_scores, _, stats = self._compute_point_offset_refinement(base_scores, delta_map, return_stats=True)
+            if getattr(self.args, "point_offset_debug", False):
+                debug_limit = max(int(getattr(self.args, "point_offset_debug_limit", 5)), 0)
+                if self.point_offset_debug_count < debug_limit:
+                    stats_text = ", ".join([f"{key}={value:.6f}" for key, value in stats.items()])
+                    print(f"[PointOffsetDebug] {stats_text}")
+                    self.point_offset_debug_count += 1
         return refined_scores.reshape_as(s_map)
 
     def build_point_offset_training_sample_from_map(self, s_map, unorganized_pc_no_zeros, mask):
@@ -671,16 +741,28 @@ class Features(torch.nn.Module):
         if target.shape[0] != base_scores.shape[0]:
             return None
 
-        alpha = max(float(getattr(self.args, "point_offset_alpha", 0.1)), 0.0)
         self.point_offset_head.train()
         delta_map = self.point_offset_head(input_features).squeeze(1)
-        base_logits = self._safe_logit(base_scores)
-        refined_logits = base_logits + alpha * delta_map
-        refined_scores = torch.sigmoid(refined_logits)
+        refined_scores, refined_logits = self._compute_point_offset_refinement(base_scores, delta_map)
+        effective_delta = self._clamp_point_offset_delta(self._center_point_offset_delta(delta_map))
 
-        bce_loss = torch.nn.functional.binary_cross_entropy_with_logits(refined_logits, target)
+        pixel_blend = float(np.clip(getattr(self.args, "point_offset_pixel_blend", 1.0), 0.0, 1.0))
+        if pixel_blend >= 1.0:
+            bce_loss = torch.nn.functional.binary_cross_entropy_with_logits(refined_logits, target)
+        else:
+            bce_loss = torch.nn.functional.binary_cross_entropy(refined_scores.clamp(1e-6, 1.0 - 1e-6), target)
         dice_loss = self._compute_dice_loss(refined_scores, target)
-        loss = bce_loss + dice_loss
+        consistency_weight = max(float(getattr(self.args, "point_offset_consistency_weight", 0.0)), 0.0)
+        consistency_loss = torch.mean(torch.abs(refined_scores - base_scores))
+        rank_weight = max(float(getattr(self.args, "point_offset_rank_weight", 0.0)), 0.0)
+        rank_loss = torch.zeros((), device=self.args.device)
+        if rank_weight > 0.0:
+            positive_delta = effective_delta[target > 0.5]
+            negative_delta = effective_delta[target <= 0.5]
+            if positive_delta.numel() > 0 and negative_delta.numel() > 0:
+                rank_margin = max(float(getattr(self.args, "point_offset_rank_margin", 0.1)), 0.0)
+                rank_loss = torch.relu(rank_margin - positive_delta.mean() + negative_delta.mean())
+        loss = bce_loss + dice_loss + consistency_weight * consistency_loss + rank_weight * rank_loss
 
         self.point_offset_optimizer.zero_grad()
         loss.backward()
@@ -1168,6 +1250,12 @@ class Features(torch.nn.Module):
 
 
     def run_coreset(self):
+        if len(self.patch_lib) == 0:
+            raise RuntimeError(
+                "No training features were collected before run_coreset(). "
+                "The training dataloader is likely empty or feature extraction failed. "
+                "For Real3D, check REAL3D_DATASETS_PATH and the class train directory/file extensions."
+            )
         self.patch_lib = torch.cat(self.patch_lib, 0).cpu()
         n = len(self.patch_lib)
 
